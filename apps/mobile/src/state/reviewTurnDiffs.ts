@@ -4,6 +4,10 @@ import { Atom, type AtomRegistry } from "effect/reactivity";
 
 const EMPTY_TURN_DIFFS = Object.freeze<Readonly<Record<number, string>>>({});
 
+// The review caches the parsed diffs within a budget; the raw ones it keeps are the same text.
+const MAX_CACHED_REVIEW_TURN_DIFFS = 8;
+const MAX_CACHED_REVIEW_TURN_DIFF_CHARACTERS = 4 * 1024 * 1024;
+
 // The last answered diff of each single turn, keyed by its turn count, so review keeps showing
 // turns it already loaded while the environment is disconnected and no turn query is mounted.
 const lastTurnDiffsFamily = Atom.family((key: string) =>
@@ -16,6 +20,31 @@ const lastTurnDiffsFamily = Atom.family((key: string) =>
 export function lastReviewTurnDiffsAtom(environmentId: EnvironmentId, threadId: ThreadId) {
   return lastTurnDiffsFamily(JSON.stringify([environmentId, threadId]));
 }
+
+/** Drops the oldest turn diffs until the cache fits its budget. */
+const pruneTurnDiffs = (diffs: Readonly<Record<number, string>>) => {
+  const turnCounts = Object.keys(diffs).map((key) => Number(key));
+  let characters = turnCounts.reduce(
+    (total, turnCount) => total + (diffs[turnCount]?.length ?? 0),
+    0,
+  );
+  let dropped = 0;
+  while (
+    turnCounts.length - dropped > MAX_CACHED_REVIEW_TURN_DIFFS ||
+    characters > MAX_CACHED_REVIEW_TURN_DIFF_CHARACTERS
+  ) {
+    const oldest = turnCounts[dropped];
+    if (oldest === undefined) break;
+    characters -= diffs[oldest]?.length ?? 0;
+    dropped += 1;
+  }
+  if (dropped === 0) return diffs;
+  const kept: Record<number, string> = { ...diffs };
+  for (const turnCount of turnCounts.slice(0, dropped)) {
+    delete kept[turnCount];
+  }
+  return kept;
+};
 
 export const recordReviewTurnDiffAnswer = (
   target: {
@@ -34,5 +63,5 @@ export const recordReviewTurnDiffAnswer = (
     const atom = lastReviewTurnDiffsAtom(target.environmentId, value.threadId);
     const current = registry.get(atom);
     if (current[value.toTurnCount] === value.diff) return;
-    registry.set(atom, { ...current, [value.toTurnCount]: value.diff });
+    registry.set(atom, pruneTurnDiffs({ ...current, [value.toTurnCount]: value.diff }));
   });
