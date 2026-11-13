@@ -2,7 +2,7 @@ import {
   ConnectionTransientError,
   PrimaryConnectionTarget,
 } from "@t3tools/client-runtime/connection";
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ThreadId, type VcsListRefsResult } from "@t3tools/contracts";
 import { ConnectionCatalogDocument, Persistence } from "@t3tools/client-runtime/platform";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -10,8 +10,10 @@ import * as Deferred from "effect/Deferred";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import { afterEach, vi } from "vite-plus/test";
 
+import { installFakeIndexedDb } from "../../test/fakeIndexedDb";
 import * as ConnectionStorage from "./storage";
 
 const emptyCatalog = {
@@ -192,6 +194,82 @@ describe("IndexedDB connection closed without a close event", () => {
         const loaded = yield* cache.loadThread(EnvironmentId.make("env"), ThreadId.make("thread"));
         expect(Option.isNone(loaded)).toBe(true);
         expect(open).toHaveBeenCalledTimes(2);
+      }).pipe(Effect.provide(ConnectionStorage.layer));
+    }),
+  );
+});
+
+describe("IndexedDB cache budgets", () => {
+  const environmentId = EnvironmentId.make("env");
+  const refs = {
+    isRepo: true,
+    hasPrimaryRemote: false,
+    nextCursor: null,
+    totalCount: 0,
+    refs: [],
+  } satisfies VcsListRefsResult;
+
+  it.effect("drops a cached row that is older than the cache's age limit", () =>
+    Effect.gen(function* () {
+      vi.stubGlobal("window", {});
+      installFakeIndexedDb();
+
+      yield* Effect.gen(function* () {
+        const cache = yield* Persistence.EnvironmentCacheStore;
+        yield* cache.saveVcsRefs(environmentId, "/repo-old", refs);
+        yield* TestClock.adjust("31 days");
+        yield* cache.saveVcsRefs(environmentId, "/repo-new", refs);
+
+        expect(Option.isNone(yield* cache.loadVcsRefs(environmentId, "/repo-old"))).toBe(true);
+        expect(Option.isSome(yield* cache.loadVcsRefs(environmentId, "/repo-new"))).toBe(true);
+      }).pipe(Effect.provide(ConnectionStorage.layer));
+    }),
+  );
+
+  it.effect("drops the oldest cached rows when the cache holds more rows than its budget", () =>
+    Effect.gen(function* () {
+      vi.stubGlobal("window", {});
+      installFakeIndexedDb();
+
+      yield* Effect.gen(function* () {
+        const cache = yield* Persistence.EnvironmentCacheStore;
+        for (let index = 0; index < 129; index += 1) {
+          yield* cache.saveVcsRefs(environmentId, `/repo-${index}`, refs);
+          yield* TestClock.adjust("1 millis");
+        }
+
+        expect(Option.isNone(yield* cache.loadVcsRefs(environmentId, "/repo-0"))).toBe(true);
+        expect(Option.isSome(yield* cache.loadVcsRefs(environmentId, "/repo-128"))).toBe(true);
+      }).pipe(Effect.provide(ConnectionStorage.layer));
+    }),
+  );
+
+  it.effect("drops the rows written before the cache gained its budget index", () =>
+    Effect.gen(function* () {
+      vi.stubGlobal("window", {});
+      installFakeIndexedDb({
+        oldVersion: 5,
+        seed: {
+          "vcs-refs": {
+            "env:/repo": JSON.stringify({
+              schemaVersion: 1,
+              environmentId: "env",
+              cwd: "/repo",
+              refs: {
+                isRepo: true,
+                hasPrimaryRemote: false,
+                nextCursor: null,
+                totalCount: 0,
+                refs: [],
+              },
+            }),
+          },
+        },
+      });
+
+      yield* Effect.gen(function* () {
+        const cache = yield* Persistence.EnvironmentCacheStore;
+        expect(Option.isNone(yield* cache.loadVcsRefs(environmentId, "/repo"))).toBe(true);
       }).pipe(Effect.provide(ConnectionStorage.layer));
     }),
   );
