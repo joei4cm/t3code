@@ -13,6 +13,9 @@ import {
   setConnectionEnabledInCatalog,
   setRoutesInCatalog,
   replaceCatalogValue,
+  cacheRowsToDrop,
+  type CacheBudget,
+  type CacheBudgetRow,
   Persistence,
   makeStoredShellSnapshotEncoder,
   makeStoredThreadSnapshotEncoder,
@@ -44,7 +47,7 @@ import * as Stream from "effect/Stream";
 import { projectFaviconCache } from "../assets/projectFaviconCache";
 
 const DATABASE_NAME = "t3code:connection-runtime";
-const DATABASE_VERSION = 5;
+const DATABASE_VERSION = 6;
 const CATALOG_STORE_NAME = "catalog";
 const SHELL_STORE_NAME = "shell";
 const THREAD_STORE_NAME = "thread";
@@ -56,6 +59,22 @@ const QUERY_MAX_ROWS = 256;
 const QUERY_MAX_BYTES = 32 * 1024 * 1024;
 const QUERY_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
 const QUERY_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
+const THREAD_UPDATED_INDEX_NAME = "environment-thread-updated";
+const VCS_REFS_UPDATED_INDEX_NAME = "environment-vcs-refs-updated";
+// One row per thread or repository the client has cached. Both caches are recoverable, so a row
+// over budget is dropped rather than kept, and the index carries each row's age and size so the
+// prune walks keys only. The row caps cover a busy session; the byte caps bound what the rows
+// they keep can take.
+const THREAD_CACHE_BUDGET: CacheBudget = {
+  maxRows: 64,
+  maxBytes: 32 * 1024 * 1024,
+  maxAgeMs: 30 * 24 * 60 * 60_000,
+};
+const VCS_REFS_CACHE_BUDGET: CacheBudget = {
+  maxRows: 128,
+  maxBytes: 8 * 1024 * 1024,
+  maxAgeMs: 30 * 24 * 60 * 60_000,
+};
 // A stats answer saves one row per listed PR, so the bounds index is walked once per batch of
 // saves. Each walk trims a batch below the caps, so the caps hold between walks. The batch count
 // lives in the database, so tabs sharing it share one count.
@@ -138,26 +157,51 @@ const openDatabase = Effect.fn("web.connectionStorage.openDatabase")(function* (
     }
     try {
       const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
-      request.addEventListener("upgradeneeded", () => {
-        if (!request.result.objectStoreNames.contains(CATALOG_STORE_NAME)) {
-          request.result.createObjectStore(CATALOG_STORE_NAME);
+      request.addEventListener("upgradeneeded", (event) => {
+        const database = request.result;
+        if (!database.objectStoreNames.contains(CATALOG_STORE_NAME)) {
+          database.createObjectStore(CATALOG_STORE_NAME);
         }
-        if (!request.result.objectStoreNames.contains(SHELL_STORE_NAME)) {
-          request.result.createObjectStore(SHELL_STORE_NAME);
+        if (!database.objectStoreNames.contains(SHELL_STORE_NAME)) {
+          database.createObjectStore(SHELL_STORE_NAME);
         }
-        if (!request.result.objectStoreNames.contains(THREAD_STORE_NAME)) {
-          request.result.createObjectStore(THREAD_STORE_NAME);
+        if (!database.objectStoreNames.contains(THREAD_STORE_NAME)) {
+          database.createObjectStore(THREAD_STORE_NAME);
         }
-        if (!request.result.objectStoreNames.contains(SERVER_CONFIG_STORE_NAME)) {
-          request.result.createObjectStore(SERVER_CONFIG_STORE_NAME);
+        if (!database.objectStoreNames.contains(SERVER_CONFIG_STORE_NAME)) {
+          database.createObjectStore(SERVER_CONFIG_STORE_NAME);
         }
-        if (!request.result.objectStoreNames.contains(VCS_REFS_STORE_NAME)) {
-          request.result.createObjectStore(VCS_REFS_STORE_NAME);
+        if (!database.objectStoreNames.contains(VCS_REFS_STORE_NAME)) {
+          database.createObjectStore(VCS_REFS_STORE_NAME);
         }
-        if (!request.result.objectStoreNames.contains(QUERY_STORE_NAME)) {
-          request.result
+        if (!database.objectStoreNames.contains(QUERY_STORE_NAME)) {
+          database
             .createObjectStore(QUERY_STORE_NAME)
             .createIndex(QUERY_UPDATED_INDEX_NAME, ["environmentId", "updatedAt", "bytes"]);
+        }
+        const upgrade = request.transaction;
+        if (upgrade === null) return;
+        const threadStore = upgrade.objectStore(THREAD_STORE_NAME);
+        if (!threadStore.indexNames.contains(THREAD_UPDATED_INDEX_NAME)) {
+          threadStore.createIndex(THREAD_UPDATED_INDEX_NAME, [
+            "environmentId",
+            "updatedAt",
+            "bytes",
+          ]);
+        }
+        const vcsRefsStore = upgrade.objectStore(VCS_REFS_STORE_NAME);
+        if (!vcsRefsStore.indexNames.contains(VCS_REFS_UPDATED_INDEX_NAME)) {
+          vcsRefsStore.createIndex(VCS_REFS_UPDATED_INDEX_NAME, [
+            "environmentId",
+            "updatedAt",
+            "bytes",
+          ]);
+        }
+        // Rows written before the budget index carry no age or size, so they would never be
+        // pruned. They are recoverable, so this upgrade drops them once.
+        if (event.oldVersion > 0 && event.oldVersion < DATABASE_VERSION) {
+          threadStore.clear();
+          vcsRefsStore.clear();
         }
       });
       request.addEventListener("error", () => {
@@ -346,6 +390,94 @@ function removeDatabaseValuesInRangeOnConnection(
       resume(Effect.fail(catalogError("remove", cause)));
     }
   }).pipe(Effect.withSpan("web.connectionStorage.removeDatabaseValuesInRange"));
+}
+
+/**
+ * Writes one recoverable cache row with its age and size, then drops the rows that no longer fit
+ * the budget. The index carries the age and size, so the prune reads keys only.
+ */
+function writeBoundedCacheValueOnConnection(
+  database: IDBDatabase,
+  storeName: string,
+  indexName: string,
+  environmentId: EnvironmentId,
+  key: string,
+  payload: string,
+  updatedAt: number,
+  budget: CacheBudget,
+) {
+  return Effect.callback<void, ConnectionTransientError>((resume) => {
+    try {
+      const bytes = new TextEncoder().encode(payload).length;
+      const transaction = database.transaction(storeName, "readwrite");
+      transaction.addEventListener("abort", () => {
+        resume(
+          Effect.fail(catalogError("write", transaction.error ?? "Unknown IndexedDB write error")),
+        );
+      });
+      transaction.addEventListener("complete", () => {
+        resume(Effect.void);
+      });
+      const store = transaction.objectStore(storeName);
+      store.put({ environmentId, updatedAt, bytes, payload }, key);
+      const walk = store
+        .index(indexName)
+        .openKeyCursor(IDBKeyRange.bound([environmentId], [environmentId, []]), "prev");
+      const rows: Array<CacheBudgetRow> = [];
+      walk.addEventListener("error", () => {
+        resume(Effect.fail(catalogError("write", walk.error ?? "Unknown IndexedDB cursor error")));
+      });
+      walk.addEventListener("success", () => {
+        const cursor = walk.result;
+        if (cursor === null) {
+          // The row just written is in the walk, so the budget holds as soon as this commits.
+          for (const dropped of cacheRowsToDrop(rows, budget, updatedAt)) {
+            store.delete(dropped);
+          }
+          return;
+        }
+        const [, rowUpdatedAt, rowBytes] = cursor.key as [string, number, number];
+        rows.push({ key: String(cursor.primaryKey), updatedAt: rowUpdatedAt, bytes: rowBytes });
+        cursor.continue();
+      });
+    } catch (cause) {
+      resume(Effect.fail(catalogError("write", cause)));
+    }
+  }).pipe(Effect.withSpan("web.connectionStorage.writeBoundedCacheValue"));
+}
+
+function writeBoundedCacheValue(
+  database: DatabaseHandle,
+  storeName: string,
+  indexName: string,
+  environmentId: EnvironmentId,
+  key: string,
+  payload: string,
+  budget: CacheBudget,
+) {
+  return Clock.currentTimeMillis.pipe(
+    Effect.flatMap((updatedAt) =>
+      withDatabase(database, (opened) =>
+        writeBoundedCacheValueOnConnection(
+          opened,
+          storeName,
+          indexName,
+          environmentId,
+          key,
+          payload,
+          updatedAt,
+          budget,
+        ),
+      ),
+    ),
+  );
+}
+
+/** The payload of a cached row. */
+function cachedPayload(raw: unknown): string | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const { payload } = raw as { readonly payload?: unknown };
+  return typeof payload === "string" ? payload : undefined;
 }
 
 // Mirrors mobile's pull-request cache bounds, per environment.
@@ -928,11 +1060,12 @@ export const layer = Layer.effectContext(
             threadCacheKey(environmentId, threadId),
           ).pipe(
             Effect.flatMap((raw) => {
-              if (typeof raw !== "string") {
+              const payload = cachedPayload(raw);
+              if (payload === undefined) {
                 return Effect.succeedNone;
               }
               return decodeOrDiscardOrchestrationCache(
-                decodeStoredThreadSnapshot(raw).pipe(
+                decodeStoredThreadSnapshot(payload).pipe(
                   Effect.mapError((cause) => persistenceError("load-thread", cause)),
                   Effect.map((stored) =>
                     stored.environmentId === environmentId && stored.threadId === threadId
@@ -964,7 +1097,16 @@ export const layer = Layer.effectContext(
           // An older copy of a thread now too large to keep would paint stale on reopen.
           yield* Option.match(encoded, {
             onNone: () => removeDatabaseValue(database, THREAD_STORE_NAME, key),
-            onSome: (payload) => writeDatabaseValue(database, THREAD_STORE_NAME, key, payload),
+            onSome: (payload) =>
+              writeBoundedCacheValue(
+                database,
+                THREAD_STORE_NAME,
+                THREAD_UPDATED_INDEX_NAME,
+                environmentId,
+                key,
+                payload,
+                THREAD_CACHE_BUDGET,
+              ),
           });
         },
         Effect.mapError((cause) =>
@@ -981,10 +1123,11 @@ export const layer = Layer.effectContext(
             vcsRefsCacheKey(environmentId, cwd),
           ).pipe(
             Effect.flatMap((raw) => {
-              if (typeof raw !== "string") {
+              const payload = cachedPayload(raw);
+              if (payload === undefined) {
                 return Effect.succeedNone;
               }
-              return decodeStoredVcsRefs(raw).pipe(
+              return decodeStoredVcsRefs(payload).pipe(
                 Effect.mapError((cause) => persistenceError("load-vcs-refs", cause)),
                 Effect.map((stored) =>
                   stored.environmentId === environmentId && stored.cwd === cwd
@@ -1009,11 +1152,14 @@ export const layer = Layer.effectContext(
             cwd,
             refs,
           }).pipe(Effect.mapError((cause) => persistenceError("save-vcs-refs", cause)));
-          yield* writeDatabaseValue(
+          yield* writeBoundedCacheValue(
             database,
             VCS_REFS_STORE_NAME,
+            VCS_REFS_UPDATED_INDEX_NAME,
+            environmentId,
             vcsRefsCacheKey(environmentId, cwd),
             encoded,
+            VCS_REFS_CACHE_BUDGET,
           );
         },
         Effect.mapError((cause) =>
